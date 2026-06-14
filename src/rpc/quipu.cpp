@@ -3,19 +3,22 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 //
 // quipu read RPC — walk multi-strand OP_RETURN inscriptions ("quipu") using the
-// keyless read-index (spentindex). Returns {header, body, tags}: the universal
-// envelope, the opaque assembled body, and the chain-state of the root's tag
-// outputs. The node decodes nothing type-specific; the client owns meaning.
-// This is the C++ counterpart of colegio.reading.quipuread (the Python
-// reference + differential oracle).
+// keyless read-index (spentindex + addressindex). The C++ counterpart of
+// colegio.reading (the Python reference + differential oracle):
+//   quipuread  <txid>    -> {header, body, tags}
+//   quipuroots <address> -> [root txid, ...]
+//   quipuscan  <address> -> [{root, header, body, tags}, ...]
+// The node decodes nothing type-specific; the client owns meaning.
 
 #include "rpc/server.h"
 #include "rpc/protocol.h"
 #include "validation.h"
 #include "spentindex.h"
+#include "base58.h"
 #include "chainparams.h"
 #include "primitives/transaction.h"
 #include "script/script.h"
+#include "script/standard.h"
 #include "sync.h"
 #include "util.h"
 #include "utilstrencodings.h"
@@ -105,9 +108,7 @@ static UniValue ParseEnvelope(const std::string& headerHex)
 }
 
 // Classify the root's outputs into tags (intact / SPENT), mirroring
-// colegio.tags.classify_root_outputs filtered to kind == "tag". A strand output
-// (its spender carries an OP_RETURN) is omitted; a tag is unspent (intact) or
-// spent by a non-OP_RETURN tx (an event).
+// colegio.tags.classify_root_outputs filtered to kind == "tag".
 static UniValue ClassifyRootTags(const uint256& root, const Consensus::Params& consensus)
 {
     UniValue tags(UniValue::VARR);
@@ -145,6 +146,93 @@ static UniValue ClassifyRootTags(const uint256& root, const Consensus::Params& c
     return tags;
 }
 
+// Assemble {header, body, tags} for a quipu root (the shared read core).
+static UniValue ReadQuipuObj(const uint256& root, const Consensus::Params& consensus)
+{
+    std::string headerHex = ReadStrand(root, 0, consensus);
+    std::string bodyHex;
+    for (int v = 1; ; v++) {
+        std::string strand = ReadStrand(root, v, consensus);
+        if (strand.empty())
+            break;
+        bodyHex += strand;
+    }
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("header", ParseEnvelope(headerHex));
+    obj.pushKV("body", bodyHex);
+    obj.pushKV("tags", ClassifyRootTags(root, consensus));
+    return obj;
+}
+
+// Decode an address to its index key (uint160 hash + type 1=P2PKH, 2=P2SH).
+static bool DecodeAddressToIndexKey(const std::string& addr, uint160& hashBytes, int& type)
+{
+    CBitcoinAddress address(addr);
+    if (!address.IsValid())
+        return false;
+    CTxDestination dest = address.Get();
+    if (dest.type() == typeid(CKeyID)) {
+        hashBytes = boost::get<CKeyID>(dest);
+        type = 1;
+        return true;
+    }
+    if (dest.type() == typeid(CScriptID)) {
+        hashBytes = boost::get<CScriptID>(dest);
+        type = 2;
+        return true;
+    }
+    return false;
+}
+
+// A quipu root carries no OP_RETURN of its own, and the spend of its output 0
+// is the cabeza's first knot (its OP_RETURN starts with the c1dd magic). Mirrors
+// colegio.reading.identify_quipus.
+static bool IsQuipuRoot(const uint256& txid, const Consensus::Params& consensus)
+{
+    CTransactionRef tx;
+    uint256 hb;
+    if (!GetTransaction(txid, tx, consensus, hb, true))
+        return false;
+    std::vector<unsigned char> own;
+    if (TxOpReturn(*tx, own))
+        return false;                           // a root has no OP_RETURN of its own
+    CSpentIndexKey key(txid, 0);
+    CSpentIndexValue value;
+    if (!GetSpentIndex(key, value))
+        return false;                           // output 0 unspent → not inscribed
+    CTransactionRef spender;
+    uint256 hb2;
+    if (!GetTransaction(value.txid, spender, consensus, hb2, true))
+        return false;
+    std::vector<unsigned char> payload;
+    if (!TxOpReturn(*spender, payload))
+        return false;
+    return payload.size() >= 2 && payload[0] == QUIPU_MAGIC0 && payload[1] == QUIPU_MAGIC1;
+}
+
+// Quipu roots whose outputs pay `address` (via the address index). Returns a set
+// to dedupe (a root may pay the address in more than one output).
+static std::set<uint256> QuipuRootsForAddress(const std::string& addr,
+                                              const Consensus::Params& consensus)
+{
+    uint160 hashBytes;
+    int type;
+    if (!DecodeAddressToIndexKey(addr, hashBytes, type))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    std::vector<std::pair<CAddressIndexKey, CAmount> > entries;
+    if (!GetAddressIndex(hashBytes, type, entries))
+        throw JSONRPCError(RPC_MISC_ERROR, "No information available for address");
+    std::set<uint256> candidates;
+    for (unsigned int i = 0; i < entries.size(); i++)
+        if (!entries[i].first.spending)         // received outputs → candidate roots
+            candidates.insert(entries[i].first.txhash);
+    std::set<uint256> roots;
+    for (std::set<uint256>::const_iterator it = candidates.begin(); it != candidates.end(); ++it)
+        if (IsQuipuRoot(*it, consensus))
+            roots.insert(*it);
+    return roots;
+}
+
 UniValue quipuread(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() != 1)
@@ -170,28 +258,74 @@ UniValue quipuread(const JSONRPCRequest& request)
 
     uint256 root = ParseHashV(request.params[0], "txid");
     const Consensus::Params& consensus = Params().GetConsensus(0);
-
     LOCK(cs_main);
+    return ReadQuipuObj(root, consensus);
+}
 
-    std::string headerHex = ReadStrand(root, 0, consensus);
-    std::string bodyHex;
-    for (int v = 1; ; v++) {
-        std::string strand = ReadStrand(root, v, consensus);
-        if (strand.empty())
-            break;
-        bodyHex += strand;
+UniValue quipuroots(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "quipuroots \"address\"\n"
+            "\nList the quipu root txids whose outputs pay the given address.\n"
+            "Requires -quipuindex (and -txindex).\n"
+            "\nArguments:\n"
+            "1. \"address\"   (string, required) the address to scan\n"
+            "\nResult:\n"
+            "[ \"txid\", ... ]\n"
+            "\nExamples:\n"
+            + HelpExampleCli("quipuroots", "\"<address>\"")
+            + HelpExampleRpc("quipuroots", "\"<address>\""));
+
+    if (!fAddressIndex)
+        throw JSONRPCError(RPC_MISC_ERROR,
+            "quipu read-index not enabled. Run with -quipuindex and -txindex, then -reindex-chainstate.");
+
+    const Consensus::Params& consensus = Params().GetConsensus(0);
+    LOCK(cs_main);
+    std::set<uint256> roots = QuipuRootsForAddress(request.params[0].get_str(), consensus);
+    UniValue result(UniValue::VARR);
+    for (std::set<uint256>::const_iterator it = roots.begin(); it != roots.end(); ++it)
+        result.push_back(it->GetHex());
+    return result;
+}
+
+UniValue quipuscan(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "quipuscan \"address\"\n"
+            "\nRead every quipu whose outputs pay the given address.\n"
+            "Requires -quipuindex (and -txindex).\n"
+            "\nArguments:\n"
+            "1. \"address\"   (string, required) the address to scan\n"
+            "\nResult:\n"
+            "[ {\"root\", \"header\", \"body\", \"tags\"}, ... ]\n"
+            "\nExamples:\n"
+            + HelpExampleCli("quipuscan", "\"<address>\"")
+            + HelpExampleRpc("quipuscan", "\"<address>\""));
+
+    if (!fAddressIndex)
+        throw JSONRPCError(RPC_MISC_ERROR,
+            "quipu read-index not enabled. Run with -quipuindex and -txindex, then -reindex-chainstate.");
+
+    const Consensus::Params& consensus = Params().GetConsensus(0);
+    LOCK(cs_main);
+    std::set<uint256> roots = QuipuRootsForAddress(request.params[0].get_str(), consensus);
+    UniValue result(UniValue::VARR);
+    for (std::set<uint256>::const_iterator it = roots.begin(); it != roots.end(); ++it) {
+        UniValue q = ReadQuipuObj(*it, consensus);
+        q.pushKV("root", it->GetHex());
+        result.push_back(q);
     }
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("header", ParseEnvelope(headerHex));
-    result.pushKV("body", bodyHex);
-    result.pushKV("tags", ClassifyRootTags(root, consensus));
     return result;
 }
 
 static const CRPCCommand commands[] =
-{ //  category      name          actor (function)   okSafeMode  argNames
-    { "quipu",      "quipuread",  &quipuread,        true,       {"txid"} },
+{ //  category      name           actor (function)   okSafeMode  argNames
+    { "quipu",      "quipuread",   &quipuread,        true,       {"txid"} },
+    { "quipu",      "quipuroots",  &quipuroots,       true,       {"address"} },
+    { "quipu",      "quipuscan",   &quipuscan,        true,       {"address"} },
 };
 
 void RegisterQuipuRPCCommands(CRPCTable &t)
