@@ -363,6 +363,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-sysperms", _("Create new files with system default permissions, instead of umask 077 (only effective with disabled wallet functionality)"));
 #endif
     strUsage += HelpMessageOpt("-txindex", strprintf(_("Maintain a full transaction index, used by the getrawtransaction rpc call (default: %u)"), DEFAULT_TXINDEX));
+    strUsage += HelpMessageOpt("-quipuindex", strprintf(_("Maintain the quipu read-index (address + spent indexes) for the keyless quipu node API (default: %u)"), DEFAULT_QUIPUINDEX));
 
     strUsage += HelpMessageGroup(_("Connection options:"));
     strUsage += HelpMessageOpt("-addnode=<ip>", _("Add a node to connect to and attempt to keep the connection open"));
@@ -1515,6 +1516,13 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)
                 // Check for changed -txindex state
                 if (fTxIndex != GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
                     strLoadError = _("You need to rebuild the database using -reindex-chainstate to change -txindex");
+                    break;
+                }
+
+                // Check for changed -quipuindex state
+                if (fAddressIndex != GetBoolArg("-quipuindex", DEFAULT_QUIPUINDEX) ||
+                    fSpentIndex != GetBoolArg("-quipuindex", DEFAULT_QUIPUINDEX)) {
+                    strLoadError = _("You need to rebuild the database using -reindex-chainstate to change -quipuindex");
                     break;
                 }
 

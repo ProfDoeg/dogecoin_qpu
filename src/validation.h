@@ -14,6 +14,7 @@
 #include "amount.h"
 #include "chain.h"
 #include "coins.h"
+#include "spentindex.h"
 #include "policy/policy.h" // For RECOMMENDED_MIN_TX_FEE
 #include "protocol.h" // For CMessageHeader::MessageStartChars
 #include "script/script_error.h"
@@ -143,6 +144,8 @@ static const int64_t MAX_FEE_ESTIMATION_TIP_AGE = 3 * 60 * 60;
 static const bool DEFAULT_PERMIT_BAREMULTISIG = true;
 static const bool DEFAULT_CHECKPOINTS_ENABLED = true;
 static const bool DEFAULT_TXINDEX = false;
+/** Default for -quipuindex — the keyless quipu read-index (address + spent) */
+static const bool DEFAULT_QUIPUINDEX = false;
 static const unsigned int DEFAULT_BANSCORE_THRESHOLD = 100;
 
 /** Default for -mempoolreplacement */
@@ -178,6 +181,8 @@ extern std::atomic_bool fImporting;
 extern bool fReindex;
 extern int nScriptCheckThreads;
 extern bool fTxIndex;
+extern bool fAddressIndex;
+extern bool fSpentIndex;
 extern bool fIsBareMultisigStd;
 extern bool fRequireStandard;
 extern bool fCheckBlockIndex;
@@ -287,6 +292,14 @@ bool IsInitialBlockDownload();
 std::string GetWarnings(const std::string& strFor);
 /** Retrieve a transaction (from memory pool, or from disk, if possible) */
 bool GetTransaction(const uint256 &hash, CTransactionRef &tx, const Consensus::Params& params, uint256 &hashBlock, bool fAllowSlow = false);
+
+/** quipu read-index accessors (keyless) — used by the quipu RPC */
+bool GetSpentIndex(CSpentIndexKey &key, CSpentIndexValue &value);
+bool GetAddressIndex(uint160 addressHash, int type,
+                     std::vector<std::pair<CAddressIndexKey, CAmount> > &addressIndex,
+                     int start = 0, int end = 0);
+bool GetAddressUnspent(uint160 addressHash, int type,
+                       std::vector<std::pair<CAddressUnspentKey, CAddressUnspentValue> > &unspentOutputs);
 /** Find the best known block, and make it the tip of the block chain */
 bool ActivateBestChain(CValidationState& state, const CChainParams& chainparams, std::shared_ptr<const CBlock> pblock = std::shared_ptr<const CBlock>());
 

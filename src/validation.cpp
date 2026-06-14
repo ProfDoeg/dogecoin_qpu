@@ -70,6 +70,8 @@ int nScriptCheckThreads = 0;
 std::atomic_bool fImporting(false);
 bool fReindex = false;
 bool fTxIndex = false;
+bool fAddressIndex = false;
+bool fSpentIndex = false;
 bool fHavePruned = false;
 bool fPruneMode = false;
 bool fIsBareMultisigStd = DEFAULT_PERMIT_BAREMULTISIG;
@@ -1068,6 +1070,35 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
                         bool fOverrideMempoolLimit, const CAmount nAbsurdFee)
 {
     return AcceptToMemoryPoolWithTime(pool, state, tx, fLimitFree, pfMissingInputs, GetTime(), plTxnReplaced, fOverrideMempoolLimit, nAbsurdFee);
+}
+
+bool GetSpentIndex(CSpentIndexKey &key, CSpentIndexValue &value)
+{
+    if (!fSpentIndex)
+        return false;
+    if (!pblocktree->ReadSpentIndex(key, value))
+        return false;
+    return true;
+}
+
+bool GetAddressIndex(uint160 addressHash, int type,
+                     std::vector<std::pair<CAddressIndexKey, CAmount> > &addressIndex, int start, int end)
+{
+    if (!fAddressIndex)
+        return error("address index not enabled");
+    if (!pblocktree->ReadAddressIndex(addressHash, type, addressIndex, start, end))
+        return error("unable to get txids for address");
+    return true;
+}
+
+bool GetAddressUnspent(uint160 addressHash, int type,
+                       std::vector<std::pair<CAddressUnspentKey, CAddressUnspentValue> > &unspentOutputs)
+{
+    if (!fAddressIndex)
+        return error("address index not enabled");
+    if (!pblocktree->ReadAddressUnspentIndex(addressHash, type, unspentOutputs))
+        return error("unable to get txids for address");
+    return true;
 }
 
 /** Return transaction in txOut, and if it was found inside a block, its hash is placed in hashBlock */
@@ -3736,6 +3767,11 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
     pblocktree->ReadFlag("txindex", fTxIndex);
     LogPrintf("%s: transaction index %s\n", __func__, fTxIndex ? "enabled" : "disabled");
 
+    // Check whether we have the quipu read-index (address + spent) enabled
+    pblocktree->ReadFlag("addressindex", fAddressIndex);
+    pblocktree->ReadFlag("spentindex", fSpentIndex);
+    LogPrintf("%s: quipu read-index %s\n", __func__, (fAddressIndex && fSpentIndex) ? "enabled" : "disabled");
+
     // Load pointer to end of best chain
     BlockMap::iterator it = mapBlockIndex.find(pcoinsTip->GetBestBlock());
     if (it == mapBlockIndex.end())
@@ -3988,6 +4024,11 @@ bool InitBlockIndex(const CChainParams& chainparams)
     // Use the provided setting for -txindex in the new database
     fTxIndex = GetBoolArg("-txindex", DEFAULT_TXINDEX);
     pblocktree->WriteFlag("txindex", fTxIndex);
+    // -quipuindex drives both the address and spent indexes (the read-node needs both)
+    fAddressIndex = GetBoolArg("-quipuindex", DEFAULT_QUIPUINDEX);
+    pblocktree->WriteFlag("addressindex", fAddressIndex);
+    fSpentIndex = GetBoolArg("-quipuindex", DEFAULT_QUIPUINDEX);
+    pblocktree->WriteFlag("spentindex", fSpentIndex);
     LogPrintf("Initializing databases...\n");
 
     // Only add the genesis block if not reindexing (in which case we reuse the one already on disk)
